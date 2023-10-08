@@ -1,0 +1,356 @@
+{{- if .Values.monitoring.enabled }}
+{{- include "values-secret" (dict "root" $ "package" (dict "values" (fromYaml (include "bigbang.overlays.monitoring" .))) "name" "monitoring" "defaults" (include "bigbang.defaults.monitoring" .)) }}
+{{- end }}
+
+{{- define "bigbang.defaults.monitoring" -}}
+# hostname is deprecated and replaced with domain. But if hostname exists then use it.
+{{- $domainName := default .Values.domain .Values.hostname }}
+hostname: {{ $domainName }}
+domain: {{ $domainName }}
+
+{{- $istioInjection := (and (eq (dig "istio" "injection" "enabled" .Values.monitoring) "enabled") .Values.istio.enabled) }}
+{{- $gitlabRedis := (and (ne .Values.addons.gitlab.redis.password "" ) (or .Values.addons.gitlab.enabled .Values.addons.gitlabRunner.enabled)) }}
+{{- $authserviceRedisEnabled := (and (dig "values" "redis" "enabled" false .Values.addons.authservice) .Values.addons.authservice.enabled) }}
+{{- $redisDatasource := (or $gitlabRedis .Values.addons.argocd.enabled $authserviceRedisEnabled) }}
+
+flux:
+  enabled: true
+
+networkPolicies:
+  enabled: {{ .Values.networkPolicies.enabled }}
+  controlPlaneCidr: {{ .Values.networkPolicies.controlPlaneCidr }}
+  ingressLabels:
+    {{- $gateway := default "public" .Values.monitoring.ingress.gateway }}
+    {{- $default := dict "app" (dig "gateways" $gateway "ingressGateway" nil .Values.istio) "istio" nil }}
+    {{- toYaml (dig "values" "gateways" $gateway "selector" $default .Values.istio) | nindent 4 }}
+
+openshift: {{ .Values.openshift }}
+
+minioOperator:
+  enabled: {{ .Values.addons.minioOperator.enabled }}
+
+gitlabRunner:
+  enabled: {{ .Values.addons.gitlabRunner.enabled }}
+
+istio:
+  {{- $monitoringInjection := dig "istio" "injection" "enabled" .Values.monitoring }}
+  enabled: {{ .Values.istio.enabled }}
+  prometheus:
+    enabled: true
+    {{- if and .Values.monitoring.sso.enabled (eq $monitoringInjection "disabled") }}
+    service: authservice-haproxy-sso
+    port: 8080
+    namespace: authservice
+    {{- end }}
+    gateways:
+    - istio-system/{{ default "public" .Values.monitoring.ingress.gateway }}
+  alertmanager:
+    enabled: true
+    {{- if and .Values.monitoring.sso.enabled (eq $monitoringInjection "disabled") }}
+    service: authservice-haproxy-sso
+    port: 8080
+    namespace: authservice
+    {{- end }}
+    gateways:
+    - istio-system/{{ default "public" .Values.monitoring.ingress.gateway }}
+  injection: {{ dig "istio" "injection" "enabled" .Values.monitoring }}
+
+alertmanager:
+  alertmanagerSpec:
+    # The operator performs a strategic merge to add our imagePullPolicy definition to the default containers
+    # NOTE: This functionality is not actively maintained upstream and may not work in a future monitoring upgrade
+    containers:
+      - name: "alertmanager"
+        imagePullPolicy: {{ .Values.imagePullPolicy }}
+      - name: "config-reloader"
+        imagePullPolicy: {{ .Values.imagePullPolicy }}
+    {{- if or .Values.monitoring.sso.enabled $istioInjection }}
+    podMetadata:
+      {{- if .Values.monitoring.sso.enabled }}
+      {{- $alertmanagerAuthserviceKey := (dig "selector" "key" "protect" .Values.addons.authservice.values) }}
+      {{- $alertmanagerAuthserviceValue := (dig "selector" "value" "keycloak" .Values.addons.authservice.values) }}
+      labels:
+        {{ $alertmanagerAuthserviceKey }}: {{ $alertmanagerAuthserviceValue }}
+      {{- end }}
+      {{- if $istioInjection }}
+      annotations:
+        {{ include "istioAnnotation" . }}
+      {{- end }}
+    {{- end }}
+
+prometheus:
+  prometheusSpec:
+    # The operator performs a strategic merge to add our imagePullPolicy definition to the default containers
+    # NOTE: This functionality is not actively maintained upstream and may not work in a future monitoring upgrade
+    containers:
+      - name: "prometheus"
+        imagePullPolicy: {{ .Values.imagePullPolicy }}
+      - name: "config-reloader"
+        imagePullPolicy: {{ .Values.imagePullPolicy }}
+    {{- if .Values.tempo.enabled }}
+    enableFeatures:
+      - remote-write-receiver
+    {{- end }}
+    {{- if or $istioInjection .Values.monitoring.sso.enabled .Values.addons.vault.enabled }}
+    podMetadata:
+      {{- if or .Values.monitoring.sso.enabled (and .Values.networkPolicies.enabled .Values.addons.vault.enabled) }}
+      labels:
+        {{- if .Values.monitoring.sso.enabled }}
+        {{- $prometheusAuthserviceKey := (dig "selector" "key" "protect" .Values.addons.authservice.values) }}
+        {{- $prometheusAuthserviceValue := (dig "selector" "value" "keycloak" .Values.addons.authservice.values) }}
+        {{ $prometheusAuthserviceKey }}: {{ $prometheusAuthserviceValue }}
+        {{- end }}
+        {{- if and .Values.networkPolicies.enabled .Values.addons.vault.enabled }}
+        vault-ingress: "true"
+        {{- end }}
+      {{- end }}
+      {{- if or $istioInjection .Values.addons.vault.enabled }}
+      annotations:
+        {{- if $istioInjection }}
+        {{ include "istioAnnotation" . }}
+        traffic.sidecar.istio.io/includeOutboundIPRanges: ""
+        proxy.istio.io/config: |
+          proxyMetadata:
+            OUTPUT_CERTS: /etc/istio-output-certs
+        sidecar.istio.io/userVolumeMount: '[{"name": "istio-certs", "mountPath": "/etc/istio-output-certs"}]'
+        {{- end }}
+        {{- if .Values.addons.vault.enabled }}
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-init-first: "true"
+        vault.hashicorp.com/agent-inject-token: "true"
+        vault.hashicorp.com/role: "prometheus"
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.addons.vault.enabled }}
+    additionalScrapeConfigs:
+    - job_name: vault
+      metrics_path: /v1/sys/metrics
+      params:
+        format: ['prometheus']
+      scheme: https
+      authorization:
+        credentials_file: /vault/secrets/token
+      {{- $vaultHosts := (dig "istio" "vault" "hosts" dict .Values.addons.vault.values) }}
+      {{- if $vaultHosts }}
+      static_configs:
+      - targets: [{{ tpl ($vaultHosts | first) $ }}]
+      {{- else }}
+      static_configs:
+      - targets: [vault.{{ .Values.domain }}]
+      {{- end }}
+    {{- end }}           
+    # Scrape config for service endpoints.
+    #
+    # The relabeling allows the actual service scrape endpoint to be configured
+    # via the following annotations:
+    #
+    # * `prometheus.io/scrape`: Only scrape services that have a value of `true`
+    # * `prometheus.io/scheme`: If the metrics endpoint is secured then you will need
+    # to set this to `https` & most likely set the `tls_config` of the scrape config.
+    # * `prometheus.io/path`: If the metrics path is not `/metrics` override this.
+    # * `prometheus.io/port`: If the metrics are exposed on a different port to the
+    # service then set this appropriately.
+    {{- if (dig "globalServiceEndpointMetrics" "enabled" false .Values.monitoring) }}
+    - job_name: 'kubernetes-service-endpoints'
+      kubernetes_sd_configs:
+        - role: endpoints
+      scheme: https
+      tls_config:
+        insecure_skip_verify: true
+      follow_redirects: true
+      enable_http2: true 
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+          action: replace
+          target_label: __scheme__
+          regex: (https?)
+        - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+          action: replace
+          target_label: __metrics_path__
+          regex: (.+)
+        - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+          action: replace
+          target_label: __address__
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:$2
+        - action: labelmap
+          regex: __meta_kubernetes_service_label_(.+)
+        - source_labels: [__meta_kubernetes_namespace]
+          action: replace
+          target_label: kubernetes_namespace
+        - source_labels: [__meta_kubernetes_service_name]
+          action: replace
+          target_label: kubernetes_name
+        - source_labels: [__meta_kubernetes_service_name]
+          action: drop
+          regex: '(.+)node-exporter'
+        - source_labels: [__meta_kubernetes_service_name]
+          action: drop
+          regex: '(.+)dns'
+        - source_labels: [__meta_kubernetes_service_name]
+          action: drop
+          regex: '(.+)kube-state-metrics'
+    {{- end }}
+    # Example scrape config for pods
+    #
+    # The relabeling allows the actual pod scrape endpoint to be configured via the
+    # following annotations:
+    #
+    # * `prometheus.io/scrape`: Only scrape pods that have a value of `true`
+    # * `prometheus.io/path`: If the metrics path is not `/metrics` override this.
+    # * `prometheus.io/port`: Scrape the pod on the indicated port instead of the default of `9102`.
+    {{- if (dig "globalPodEndpointMetrics" "enabled" false .Values.monitoring) }}
+    - job_name: 'kubernetes-pods'
+
+      kubernetes_sd_configs:
+        - role: pod
+    
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+          action: replace
+          target_label: __metrics_path__
+          regex: (.+)
+        - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+          action: replace
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:$2
+          target_label: __address__
+        - action: labelmap
+          regex: __meta_kubernetes_pod_label_(.+)
+        - source_labels: [__meta_kubernetes_namespace]
+          action: replace
+          target_label: kubernetes_namespace
+        - source_labels: [__meta_kubernetes_pod_name]
+          action: replace
+          target_label: kubernetes_pod_name
+    {{- end }}
+    {{- if $istioInjection }}    
+    # Add volume/mount for Istio certs for mTLS scraping
+    volumes:
+      - emptyDir:
+          medium: Memory
+        name: istio-certs
+    volumeMounts:
+      - mountPath: /etc/prom-certs/
+        name: istio-certs
+    {{- end }}
+
+anchore:
+  enabled: {{ .Values.addons.anchore.enabled }}
+
+kiali:
+  enabled: {{ .Values.kiali.enabled }}
+
+loki:
+  enabled: {{ .Values.loki.enabled }}
+
+tempo:
+  enabled: {{ .Values.tempo.enabled }}
+
+{{- if or $gitlabRedis $authserviceRedisEnabled $redisDatasource }}
+redis:
+  enabled: true
+{{- end }}
+
+vault:
+  enabled: {{ .Values.addons.vault.enabled }}
+  tlsDisable: {{ dig "global" "tlsDisable" true .Values.addons.vault.values }}
+
+global:
+  imagePullSecrets:
+  - name: private-registry
+
+sso:
+  enabled: {{ .Values.monitoring.sso.enabled }}
+
+prometheus-node-exporter:
+  image:
+    pullPolicy: {{ .Values.imagePullPolicy }}
+  serviceAccount:
+    imagePullSecrets:
+    - name: private-registry
+
+  {{- if $istioInjection }}
+  podAnnotations:
+    {{ include "istioAnnotation" . }}
+  prometheus:
+    monitor:
+      scheme: https
+      tlsConfig:
+        caFile: /etc/prom-certs/root-cert.pem
+        certFile: /etc/prom-certs/cert-chain.pem
+        keyFile: /etc/prom-certs/key.pem
+        insecureSkipVerify: true  # Prometheus does not support Istio security naming, thus skip verifying target pod certificate
+  {{- end }}
+
+  {{- if .Values.openshift }}
+  service:
+    targetPort: 9102
+    port: 9102
+  {{- end }}
+
+kube-state-metrics:
+  image:
+    pullPolicy: {{ .Values.imagePullPolicy }}
+  imagePullSecrets:
+  - name: private-registry
+
+  {{- if $istioInjection }}
+  podAnnotations:
+    {{ include "istioAnnotation" . }}
+  prometheus:
+    monitor:
+      scheme: https
+      tlsConfig:
+        caFile: /etc/prom-certs/root-cert.pem
+        certFile: /etc/prom-certs/cert-chain.pem
+        keyFile: /etc/prom-certs/key.pem
+        insecureSkipVerify: true  # Prometheus does not support Istio security naming, thus skip verifying target pod certificate
+  {{- end }}
+
+prometheusOperator:
+  image:
+    pullPolicy: {{ .Values.imagePullPolicy }}
+  admissionWebhooks:
+    cleanupProxy:
+      image:
+        pullPolicy: {{ .Values.imagePullPolicy }}
+    patch:
+      image:
+        pullPolicy: {{ .Values.imagePullPolicy }}
+  {{- if $istioInjection }}
+  podAnnotations:
+    {{ include "istioAnnotation" . }}
+  {{- end }}
+{{- end }}
+
+{{- /* This function merges defaults in lists from above into overlays */ -}}
+{{- /* The end user will not have to replicate `prometheus.prometheusSpec.additionalScrapeConfigs` or `grafana.extraSecretMounts` from above when providing an overlay */ -}}
+{{- /* There is a hidden flag `skipOverlayMerge` that can be added to `prometheus.prometheusSpec` or `grafana` overlays to ignore the defaults */ -}}
+{{- define "bigbang.overlays.monitoring" }}
+
+  {{- $defaults := fromYaml (include "bigbang.defaults.monitoring" .) }}
+
+  {{- $overlays := dig "values" dict .Values.monitoring }}
+  {{- range $prometheusConfig, $default := $defaults.prometheus }}
+    {{- $overlay := (dig "prometheus" $prometheusConfig dict $overlays) }}
+    # Only continue if an overlay matches a default constriant and hidden "skipOverlayMerge" is not set
+    {{- if and $overlay (kindIs "map" $overlay) (not $overlay.skipOverlayMerge) }}
+
+      # Add any default additionalScrapeConfigs to overlay
+      {{- if and (dig "additionalScrapeConfigs"  list $default) (dig "additionalScrapeConfigs"  list $overlay) }}
+         {{ $_ := set $overlay "additionalScrapeConfigs" (concat $default.additionalScrapeConfigs $overlay.additionalScrapeConfigs) }}
+      {{- end }}
+      
+    {{- end }}
+  {{- end }}
+{{ toYaml $overlays }}
+{{- end }}
+
